@@ -20,9 +20,19 @@ local WidgetContainer = require("ui/widget/container/widgetcontainer")
 local logger = require("logger")
 local util = require("util")
 local _ = require("gettext")
-local C_ = _.pgettext
+local Size = require("ui/size")
 
 local ReaderHighlight = require("apps/reader/modules/readerhighlight")
+
+local Screen = Device.screen
+
+-- Single-glyph style row (no translated words); matches highlight drawer keys.
+local STYLE_COMPACT_GLYPH = {
+    lighten = "░",
+    underscore = "▁",
+    strikeout = "─",
+    invert = "◐",
+}
 
 local HighlightComposePlugin = WidgetContainer:extend{
     name = "highlightcompose",
@@ -46,6 +56,52 @@ end
 
 local function colorChoiceEnabled(rh)
     return currentDrawer(rh) ~= "invert"
+end
+
+--- Prefer below/above the highlight (like "follow selection" mode) even when the global
+--- highlight popup position is "center", so the bar does not cover the selected text and
+--- boundary nudge buttons stay meaningful. Falls back to stock anchor when needed.
+local function composeDialogAnchor(rh, dialog, index)
+    local position = G_reader_settings:readSetting("highlight_dialog_position", "center")
+    if position == "gesture" or position == "top" or position == "bottom" then
+        return rh:_getDialogAnchor(dialog, index)
+    end
+    local db = dialog:getContentSize()
+    if not db or not db.w or not db.h then
+        return nil
+    end
+    local boxes = index and rh:getHighlightVisibleBoxes(index)
+        or (rh.selected_text and (rh.selected_text.sboxes or rh.selected_text.pboxes))
+    if boxes == nil then
+        return nil
+    end
+    local padding = Size.padding.small
+    local anchor_x = math.floor((rh.screen_w - db.w) / 2)
+    local box0, box1 = boxes[1], boxes[#boxes]
+    if box0.y > box1.y then
+        box0, box1 = box1, box0
+    end
+    if rh.ui.paging then
+        local page = index and rh.ui.annotation.annotations[index].pos0.page or rh.selected_text.pos0.page
+        box0 = rh.view:pageToScreenTransform(page, box0)
+        box1 = rh.view:pageToScreenTransform(page, box1)
+        if box0 == nil or box1 == nil then
+            return nil
+        end
+    end
+    local y0 = box0.y
+    local y1 = box1.y + box1.h
+    local dialog_box_h = db.h + 2 * padding
+    local anchor_y, prefers_pop_down
+    if y1 + dialog_box_h <= rh.screen_h then
+        anchor_y = y1 + padding
+        prefers_pop_down = true
+    elseif dialog_box_h <= y0 then
+        anchor_y = y0 - padding
+    else
+        return nil
+    end
+    return { x = anchor_x, y = anchor_y, h = 0, w = 0 }, prefers_pop_down
 end
 
 --- Adjust live selection edges (same logic as editing a saved highlight).
@@ -191,47 +247,93 @@ local function buildComposeDialog(rh, index)
         rh.view.highlight.saved_color = color
     end
 
-    -- Rows of color buttons (3 per row)
+    local function openNoteEditor()
+        local note_dialog
+        local note_opts = {
+            title = _("Note"),
+            input = pending_note or "",
+            input_hint = _("Optional note"),
+            allow_newline = true,
+            add_scroll_buttons = true,
+            use_available_height = true,
+            buttons = {
+                {
+                    {
+                        text = _("Cancel"),
+                        id = "close",
+                        callback = function()
+                            UIManager:close(note_dialog, "flashui")
+                        end,
+                    },
+                    {
+                        text = _("Save"),
+                        is_enter_default = true,
+                        callback = function()
+                            pending_note = note_dialog:getInputText()
+                            rh.selected_text.note = pending_note ~= "" and pending_note or nil
+                            UIManager:close(note_dialog)
+                        end,
+                    },
+                },
+            },
+        }
+        if index then
+            note_opts.description = "   " .. rh.ui.bookmark:_getDialogHeader(rh.ui.annotation.annotations[index])
+        end
+        note_dialog = InputDialog:new(note_opts)
+        UIManager:show(note_dialog)
+        note_dialog:onShowKeyboard()
+    end
+
     local buttons = {}
     local color_list = rh.highlight_colors
     local bg_colors = rh:getHighlightColorList()
-    for i = 1, #color_list, 3 do
-        local row = {}
-        for j = i, math.min(i + 2, #color_list) do
-            local label, key = unpack(color_list[j])
-            local btn_id = "hlc_" .. key
-            table.insert(color_button_ids, btn_id)
-            table.insert(row, {
-                id = btn_id,
-                text = label,
-                menu_style = true,
-                background = bg_colors[j],
-                checked_func = function()
-                    return currentColor(rh) == key
-                end,
-                enabled_func = function()
-                    return colorChoiceEnabled(rh)
-                end,
-                callback = function()
-                    rh.selected_text.color = key
-                    applyColorToDefaults(key)
-                    refreshButtonCheckmarks(compose_dialog, color_button_ids)
-                end,
-            })
-        end
-        table.insert(buttons, row)
-    end
+    -- Short vertical strips; color row is the thinnest (wide horizontal bar).
+    local color_strip_h = Screen:scaleBySize(20)
+    local mid_row_h = Screen:scaleBySize(26)
+    local action_row_h = Screen:scaleBySize(28)
 
-    -- Highlight styles
+    -- One row: color swatches only (no labels); checkmark shows selection.
+    -- (Do not set width on every button in a row — ButtonTable divides by unspecified count.)
+    local color_row = {}
+    for j = 1, #color_list do
+        local _, key = unpack(color_list[j])
+        local btn_id = "hlc_" .. key
+        table.insert(color_button_ids, btn_id)
+        table.insert(color_row, {
+            id = btn_id,
+            text = " ",
+            align = "center",
+            font_size = 12,
+            height = color_strip_h,
+            background = bg_colors[j],
+            checked_func = function()
+                return currentColor(rh) == key
+            end,
+            enabled_func = function()
+                return colorChoiceEnabled(rh)
+            end,
+            callback = function()
+                rh.selected_text.color = key
+                applyColorToDefaults(key)
+                refreshButtonCheckmarks(compose_dialog, color_button_ids)
+            end,
+        })
+    end
+    table.insert(buttons, color_row)
+
+    -- Styles + note (one row): compact glyphs and pencil.
     local style_row = {}
     for _, pair in ipairs(ReaderHighlight.getHighlightStyles()) do
-        local label, key = unpack(pair)
+        local _, key = unpack(pair)
         local btn_id = "hls_" .. key
         table.insert(style_button_ids, btn_id)
         table.insert(style_row, {
             id = btn_id,
-            text = label,
-            menu_style = true,
+            text = STYLE_COMPACT_GLYPH[key] or "·",
+            align = "center",
+            font_size = 20,
+            height = mid_row_h,
             checked_func = function()
                 return currentDrawer(rh) == key
             end,
@@ -250,49 +352,14 @@ local function buildComposeDialog(rh, index)
             end,
         })
     end
+    table.insert(style_row, {
+        text = "\u{F040}",
+        align = "center",
+        font_size = 20,
+        height = mid_row_h,
+        callback = openNoteEditor,
+    })
     table.insert(buttons, style_row)
-
-    -- Note
-    table.insert(buttons, {{
-        text = _("Add / edit note"),
-        callback = function()
-            local note_dialog
-            local note_opts = {
-                title = _("Note"),
-                input = pending_note or "",
-                input_hint = _("Optional note"),
-                allow_newline = true,
-                add_scroll_buttons = true,
-                use_available_height = true,
-                buttons = {
-                    {
-                        {
-                            text = _("Cancel"),
-                            id = "close",
-                            callback = function()
-                                UIManager:close(note_dialog, "flashui")
-                            end,
-                        },
-                        {
-                            text = _("Save"),
-                            is_enter_default = true,
-                            callback = function()
-                                pending_note = note_dialog:getInputText()
-                                rh.selected_text.note = pending_note ~= "" and pending_note or nil
-                                UIManager:close(note_dialog)
-                            end,
-                        },
-                    },
-                },
-            }
-            if index then
-                note_opts.description = "   " .. rh.ui.bookmark:_getDialogHeader(rh.ui.annotation.annotations[index])
-            end
-            note_dialog = InputDialog:new(note_opts)
-            UIManager:show(note_dialog)
-            note_dialog:onShowKeyboard()
-        end,
-    }})
 
     -- Selection boundary controls (same glyphs as stock edit-highlight dialog)
     local change_boundaries_enabled = boundariesEnabled(rh)
@@ -304,6 +371,9 @@ local function buildComposeDialog(rh, index)
     table.insert(buttons, {
         {
             text = start_prev,
+            align = "center",
+            font_size = 18,
+            height = action_row_h,
             enabled = change_boundaries_enabled,
             callback = function()
                 updatePendingBounds(rh, 0, -1, move_by_char)
@@ -315,6 +385,9 @@ local function buildComposeDialog(rh, index)
         },
         {
             text = start_next,
+            align = "center",
+            font_size = 18,
+            height = action_row_h,
             enabled = change_boundaries_enabled,
             callback = function()
                 updatePendingBounds(rh, 0, 1, move_by_char)
@@ -326,6 +399,9 @@ local function buildComposeDialog(rh, index)
         },
         {
             text = end_prev,
+            align = "center",
+            font_size = 18,
+            height = action_row_h,
             enabled = change_boundaries_enabled,
             callback = function()
                 updatePendingBounds(rh, 1, -1, move_by_char)
@@ -337,6 +413,9 @@ local function buildComposeDialog(rh, index)
         },
         {
             text = end_next,
+            align = "center",
+            font_size = 18,
+            height = action_row_h,
             enabled = change_boundaries_enabled,
             callback = function()
                 updatePendingBounds(rh, 1, 1, move_by_char)
@@ -348,10 +427,28 @@ local function buildComposeDialog(rh, index)
         },
     })
 
-    -- Select / extend, legacy actions, confirm
+    -- Trash (delete saved highlight or discard new selection), then select / more / confirm
     table.insert(buttons, {
         {
+            text = "\u{F48E}", -- trash can (same glyph as stock highlight editor)
+            align = "center",
+            font_size = 20,
+            height = action_row_h,
+            callback = function()
+                closeCompose()
+                if index then
+                    rh:deleteHighlight(index)
+                    rh.selected_text = nil
+                else
+                    rh:onClose()
+                end
+            end,
+        },
+        {
             text = index and _("Extend") or _("Select"),
+            align = "center",
+            font_size = 17,
+            height = action_row_h,
             enabled = not (index and rh.ui.annotation.annotations[index].text_edited),
             callback = function()
                 closeCompose()
@@ -363,6 +460,9 @@ local function buildComposeDialog(rh, index)
         },
         {
             text = "…",
+            align = "center",
+            font_size = 20,
+            height = action_row_h,
             callback = function()
                 closeCompose()
                 showLegacyHighlightMenu(rh, index)
@@ -370,6 +470,9 @@ local function buildComposeDialog(rh, index)
         },
         {
             text = "\u{2713}",
+            align = "center",
+            font_size = 20,
+            height = action_row_h,
             callback = function()
                 rh.selected_text.drawer = currentDrawer(rh)
                 rh.selected_text.color = currentColor(rh)
@@ -394,13 +497,14 @@ local function buildComposeDialog(rh, index)
     })
 
     compose_dialog = ButtonDialog:new{
-        title = C_("Highlight compose", "Highlight & note"),
+        title = nil,
         buttons = buttons,
         colorful = true,
-        width_factor = 0.92,
+        width_factor = 0.94,
+        shrink_unneeded_width = false,
         rows_per_page = { 5, 6, 7, 8 },
         anchor = function()
-            return rh:_getDialogAnchor(compose_dialog, index)
+            return composeDialogAnchor(rh, compose_dialog, index)
         end,
         tap_close_callback = function()
             if rh.hold_pos then
