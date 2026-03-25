@@ -26,6 +26,20 @@ local ReaderHighlight = require("apps/reader/modules/readerhighlight")
 
 local Screen = Device.screen
 
+--- Background colors for highlight swatches (same as ReaderHighlight:getHighlightColorList()).
+--- Some release builds (e.g. certain v2026.03 installs) omit that helper; build the list here.
+local function getHighlightBgColorsForDialog(rh)
+    local fn = ReaderHighlight.getHighlightColorList
+    if type(fn) == "function" then
+        return fn(rh)
+    end
+    local color_list = {}
+    for i, color in ipairs(rh.highlight_colors) do
+        color_list[i] = rh:getHighlightColor(color[2])
+    end
+    return color_list
+end
+
 -- Single-glyph style row (no translated words); matches highlight drawer keys.
 local STYLE_COMPACT_GLYPH = {
     lighten = "░",
@@ -64,25 +78,52 @@ end
 local function composeDialogAnchor(rh, dialog, index)
     local position = G_reader_settings:readSetting("highlight_dialog_position", "center")
     if position == "gesture" or position == "top" or position == "bottom" then
-        return rh:_getDialogAnchor(dialog, index)
-    end
-    local db = dialog:getContentSize()
-    if not db or not db.w or not db.h then
+        local ok, a, b = pcall(function()
+            return rh:_getDialogAnchor(dialog, index)
+        end)
+        if ok then
+            return a, b
+        end
+        logger.warn("highlightcompose: _getDialogAnchor failed:", a)
         return nil
     end
-    local boxes = index and rh:getHighlightVisibleBoxes(index)
-        or (rh.selected_text and (rh.selected_text.sboxes or rh.selected_text.pboxes))
-    if boxes == nil then
+    local ok, db = pcall(function()
+        return dialog:getContentSize()
+    end)
+    if not ok or not db or not db.w or not db.h then
+        return nil
+    end
+    local boxes
+    if index then
+        local ok_boxes, res = pcall(function()
+            return rh:getHighlightVisibleBoxes(index)
+        end)
+        if ok_boxes and res and #res > 0 then
+            boxes = res
+        end
+    end
+    if not boxes or #boxes == 0 then
+        boxes = rh.selected_text and (rh.selected_text.sboxes or rh.selected_text.pboxes)
+    end
+    if boxes == nil or #boxes == 0 then
+        return nil
+    end
+    local box0, box1 = boxes[1], boxes[#boxes]
+    if not box0 or not box1 or box0.y == nil or box1.y == nil then
         return nil
     end
     local padding = Size.padding.small
     local anchor_x = math.floor((rh.screen_w - db.w) / 2)
-    local box0, box1 = boxes[1], boxes[#boxes]
     if box0.y > box1.y then
         box0, box1 = box1, box0
     end
     if rh.ui.paging then
-        local page = index and rh.ui.annotation.annotations[index].pos0.page or rh.selected_text.pos0.page
+        local ann = index and rh.ui.annotation.annotations[index]
+        local pos0 = ann and ann.pos0 or (rh.selected_text and rh.selected_text.pos0)
+        local page = type(pos0) == "table" and pos0.page or nil
+        if not page then
+            return nil
+        end
         box0 = rh.view:pageToScreenTransform(page, box0)
         box1 = rh.view:pageToScreenTransform(page, box1)
         if box0 == nil or box1 == nil then
@@ -90,7 +131,7 @@ local function composeDialogAnchor(rh, dialog, index)
         end
     end
     local y0 = box0.y
-    local y1 = box1.y + box1.h
+    local y1 = box1.y + (box1.h or 0)
     local dialog_box_h = db.h + 2 * padding
     local anchor_y, prefers_pop_down
     if y1 + dialog_box_h <= rh.screen_h then
@@ -287,7 +328,7 @@ local function buildComposeDialog(rh, index)
 
     local buttons = {}
     local color_list = rh.highlight_colors
-    local bg_colors = rh:getHighlightColorList()
+    local bg_colors = getHighlightBgColorsForDialog(rh)
     -- Short vertical strips; color row is the thinnest (wide horizontal bar).
     local color_strip_h = Screen:scaleBySize(20)
     local mid_row_h = Screen:scaleBySize(26)
@@ -504,7 +545,12 @@ local function buildComposeDialog(rh, index)
         shrink_unneeded_width = false,
         rows_per_page = { 5, 6, 7, 8 },
         anchor = function()
-            return composeDialogAnchor(rh, compose_dialog, index)
+            local ok, r1, r2 = pcall(composeDialogAnchor, rh, compose_dialog, index)
+            if not ok then
+                logger.warn("highlightcompose: composeDialogAnchor failed:", r1)
+                return nil
+            end
+            return r1, r2
         end,
         tap_close_callback = function()
             if rh.hold_pos then
@@ -535,7 +581,11 @@ local function showHighlightNoteOrDialogPatched(rh, index)
     if G_reader_settings:isTrue("highlight_compose_menu_disabled") then
         return orig_showHighlightNoteOrDialog(rh, index)
     end
-    rh.selected_text = util.tableDeepCopy(rh.ui.annotation.annotations[index])
+    local ann = rh.ui.annotation.annotations[index]
+    if not ann then
+        return orig_showHighlightNoteOrDialog(rh, index)
+    end
+    rh.selected_text = util.tableDeepCopy(ann)
     if rh.highlight_dialog then
         UIManager:close(rh.highlight_dialog)
         rh.highlight_dialog = nil
